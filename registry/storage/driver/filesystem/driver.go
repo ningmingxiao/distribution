@@ -165,26 +165,26 @@ func (d *driver) PutContent(ctx context.Context, subPath string, contents []byte
 		dErr := d.Delete(ctx, tempPath)
 		return errors.Join(err, dErr)
 	}
-	if err := syncDir(filepath.Dir(d.fullPath(subPath))); err != nil {
-		return err
-	}
-	return nil
+	return syncDir(filepath.Dir(d.fullPath(subPath)))
 }
 
-func syncDir(dir string) (err error) {
+func syncDir(dir string) (retErr error) {
 	dirF, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("failed to open dir %s: %w", dir, err)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("sync dir: %w", err)
 	}
 	defer func() {
-		if cerr := dirF.Close(); cerr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to close dir %s: %w", dir, cerr))
+		if err := dirF.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to close dir: %w", err))
 		}
 	}()
-	if err = dirF.Sync(); err != nil {
-		err = fmt.Errorf("failed to sync dir %s: %w", dir, err)
+	if err := dirF.Sync(); err != nil {
+		return fmt.Errorf("sync dir: %w", err)
 	}
-	return err
+	return nil
 }
 
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
@@ -408,24 +408,27 @@ func (fw *fileWriter) Size() int64 {
 	return fw.size
 }
 
-func (fw *fileWriter) Close() error {
+func (fw *fileWriter) Close() (retErr error) {
 	if fw.closed {
 		return fmt.Errorf("already closed")
+	}
+	fw.closed = true
+	defer func() {
+		if err := fw.file.Close(); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+
+	if fw.committed {
+		// Already flushed and synced
+		return nil
 	}
 
 	if err := fw.bw.Flush(); err != nil {
 		return err
 	}
 
-	if err := fw.file.Sync(); err != nil {
-		return err
-	}
-
-	if err := fw.file.Close(); err != nil {
-		return err
-	}
-	fw.closed = true
-	return nil
+	return fw.file.Sync()
 }
 
 func (fw *fileWriter) Cancel(ctx context.Context) error {
@@ -434,7 +437,8 @@ func (fw *fileWriter) Cancel(ctx context.Context) error {
 	}
 
 	fw.cancelled = true
-	fw.file.Close()
+	fw.closed = true
+	_ = fw.file.Close()
 	return os.Remove(fw.file.Name())
 }
 
